@@ -14,6 +14,7 @@ import Browser
 import Browser.Events
 import Camera3d exposing (Camera3d)
 import Color exposing (Color)
+import Dict exposing (Dict)
 import Direction3d
 import File exposing (File)
 import File.Select
@@ -22,17 +23,22 @@ import Html.Attributes
 import Html.Events
 import Json.Decode
 import Length exposing (Meters)
+import Mtl.Decode
 import Obj.Decode exposing (Decoder, ObjCoordinates)
 import Pixels exposing (Pixels)
 import Point3d exposing (Point3d)
 import Quantity exposing (Quantity)
 import Scene3d
-import Scene3d.Material exposing (Texture)
+import Scene3d.Material exposing (Material, Texture)
 import Scene3d.Mesh exposing (Textured, Uniform)
 import Task
 import TriangularMesh exposing (TriangularMesh)
 import Viewpoint3d
 import WebGL.Texture exposing (Error(..))
+
+
+type alias MeshWithMaterial =
+    ( String, ViewMesh )
 
 
 type ViewMesh
@@ -43,7 +49,7 @@ type ViewMesh
 {-| Because we don’t know the exect format of a mesh, we try decoding different
 primitives: from the most specific to the most simple one.
 -}
-meshWithBoundingBoxDecoder : Decoder ( ViewMesh, BoundingBox3d Meters ObjCoordinates )
+meshWithBoundingBoxDecoder : Decoder ( List MeshWithMaterial, BoundingBox3d Meters ObjCoordinates )
 meshWithBoundingBoxDecoder =
     Obj.Decode.oneOf
         [ withBoundingBox .position (Scene3d.Mesh.texturedFaces >> TexturedMesh) Obj.Decode.texturedFaces
@@ -53,23 +59,47 @@ meshWithBoundingBoxDecoder =
         ]
 
 
+trianglesForMaterials : Decoder a -> List String -> Decoder (List ( String, a ))
+trianglesForMaterials trianglesDecoder names =
+    names
+        |> List.map
+            (\materialName ->
+                Obj.Decode.material materialName trianglesDecoder
+                    |> Obj.Decode.map (\mesh -> ( materialName, mesh ))
+            )
+        |> Obj.Decode.combine
+
+
+withMaterials : Decoder a -> Decoder (List ( String, a ))
+withMaterials trianglesDecoder =
+    Obj.Decode.materialNames
+        |> Obj.Decode.andThen (trianglesForMaterials trianglesDecoder)
+
+
 withBoundingBox :
     (a -> Point3d Meters ObjCoordinates) -- a function that knows how to extract position of a vertex
     -> (TriangularMesh a -> ViewMesh) -- a function that knows how to create a ViewMesh
     -> Decoder (TriangularMesh a) -- a primitive decoder
-    -> Decoder ( ViewMesh, BoundingBox3d Meters ObjCoordinates )
-withBoundingBox getPosition createMesh =
-    Obj.Decode.map
-        (\triangularMesh ->
-            ( createMesh triangularMesh
-            , case List.map getPosition (Array.toList (TriangularMesh.vertices triangularMesh)) of
-                first :: rest ->
-                    BoundingBox3d.hull first rest
+    -> Decoder ( List MeshWithMaterial, BoundingBox3d Meters ObjCoordinates )
+withBoundingBox getPosition createMesh meshDecoder =
+    meshDecoder
+        |> withMaterials
+        |> Obj.Decode.map
+            (List.foldl
+                (\( material, triangularMesh ) ( meshes, boundingBox ) ->
+                    ( ( material, createMesh triangularMesh ) :: meshes
+                    , BoundingBox3d.union boundingBox
+                        (case List.map getPosition (Array.toList (TriangularMesh.vertices triangularMesh)) of
+                            first :: rest ->
+                                BoundingBox3d.hull first rest
 
-                [] ->
-                    BoundingBox3d.singleton Point3d.origin
+                            [] ->
+                                BoundingBox3d.singleton Point3d.origin
+                        )
+                    )
+                )
+                ( [], BoundingBox3d.singleton Point3d.origin )
             )
-        )
 
 
 type LoadState a
@@ -79,8 +109,9 @@ type LoadState a
 
 
 type alias Model =
-    { texture : LoadState (Texture Color)
-    , meshWithBoundingBox : LoadState ( ViewMesh, BoundingBox3d Meters ObjCoordinates )
+    { materials : LoadState (Dict String Color)
+    , texture : LoadState (Texture Color)
+    , meshWithBoundingBox : LoadState ( List MeshWithMaterial, BoundingBox3d Meters ObjCoordinates )
     , hover : Bool
     , azimuth : Angle
     , elevation : Angle
@@ -94,8 +125,9 @@ type Msg
     | ResetClicked
     | DragEnter
     | DragLeave
+    | LoadedMaterials (Result String (Dict String Color))
     | LoadedTexture (Result WebGL.Texture.Error (Texture Color))
-    | LoadedMesh (Result String ( ViewMesh, BoundingBox3d Meters ObjCoordinates ))
+    | LoadedMeshes (Result String ( List MeshWithMaterial, BoundingBox3d Meters ObjCoordinates ))
     | GotFiles File (List File)
     | MouseDown
     | MouseUp
@@ -108,7 +140,8 @@ main =
     Browser.element
         { init =
             always
-                ( { texture = Empty
+                ( { materials = Empty
+                  , texture = Empty
                   , meshWithBoundingBox = Empty
                   , hover = False
                   , azimuth = Angle.degrees -45
@@ -153,7 +186,7 @@ update msg model =
 
         GotFiles file files ->
             let
-                ( imageFiles, objFiles ) =
+                ( imageFiles, objAndMtlFiles ) =
                     List.partition
                         (File.mime >> String.startsWith "image/")
                         (file :: files)
@@ -170,6 +203,11 @@ update msg model =
 
                         [] ->
                             Cmd.none
+
+                ( mtlFiles, objFiles ) =
+                    List.partition
+                        (File.name >> String.endsWith ".mtl")
+                        objAndMtlFiles
 
                 loadAndDecodeMeshCmd =
                     case objFiles of
@@ -189,16 +227,51 @@ update msg model =
                                             Err err ->
                                                 Task.fail err
                                     )
-                                |> Task.attempt LoadedMesh
+                                |> Task.attempt LoadedMeshes
+
+                        [] ->
+                            Cmd.none
+
+                loadMaterialsCmd =
+                    case mtlFiles of
+                        mtlFile :: _ ->
+                            File.toString mtlFile
+                                |> Task.andThen
+                                    (\string ->
+                                        case
+                                            Mtl.Decode.decodeString
+                                                { createMaterial = createMaterialFromString }
+                                                string
+                                        of
+                                            Ok m ->
+                                                Task.succeed m
+
+                                            Err err ->
+                                                Task.fail err
+                                    )
+                                |> Task.attempt LoadedMaterials
 
                         [] ->
                             Cmd.none
             in
-            ( { model | hover = False }, Cmd.batch [ loadTextureCmd, loadAndDecodeMeshCmd ] )
+            ( { model | hover = False }, Cmd.batch [ loadMaterialsCmd, loadTextureCmd, loadAndDecodeMeshCmd ] )
 
-        LoadedMesh result ->
+        LoadedMeshes result ->
             ( { model
                 | meshWithBoundingBox =
+                    case result of
+                        Err err ->
+                            Error err
+
+                        Ok m ->
+                            Loaded m
+              }
+            , Cmd.none
+            )
+
+        LoadedMaterials result ->
+            ( { model
+                | materials =
                     case result of
                         Err err ->
                             Error err
@@ -256,10 +329,37 @@ update msg model =
             ( { model | zoom = clamp 0 1 (model.zoom - deltaY * 0.002) }, Cmd.none )
 
 
-meshView : Camera3d Meters ObjCoordinates -> LoadState (Texture Color) -> ViewMesh -> Html Msg
-meshView camera loadingTexture mesh =
+createMaterialFromString : String -> List String -> Maybe Color -> Maybe Color
+createMaterialFromString name parameters maybeColor =
+    case parameters of
+        "Kd" :: values ->
+            case List.map String.toFloat values of
+                [ Just red, Just green, Just blue ] ->
+                    Just <| Color.rgb red green blue
+
+                _ ->
+                    maybeColor
+
+        [ "D", value ] ->
+            case ( maybeColor |> Maybe.map Color.toRgba, String.toFloat value ) of
+                ( Just { red, green, blue }, Just alpha ) ->
+                    Just <| Color.rgba red green blue alpha
+
+                _ ->
+                    maybeColor
+
+        _ ->
+            maybeColor
+
+
+meshView : Camera3d Meters ObjCoordinates -> LoadState (Dict String Color) -> LoadState (Texture Color) -> List MeshWithMaterial -> Html Msg
+meshView camera loadingMaterials loadingTexture meshes =
     let
-        entity =
+        entities =
+            meshes
+                |> List.map entity
+
+        entity ( materialName, mesh ) =
             case mesh of
                 TexturedMesh texturedMesh ->
                     case loadingTexture of
@@ -273,7 +373,28 @@ meshView camera loadingTexture mesh =
                             Scene3d.mesh (Scene3d.Material.matte Color.blue) texturedMesh
 
                 UniformMesh uniformMesh ->
-                    Scene3d.mesh (Scene3d.Material.matte Color.blue) uniformMesh
+                    let
+                        color =
+                            case loadingMaterials of
+                                Loaded materials ->
+                                    Dict.get materialName materials
+                                        |> Maybe.withDefault Color.red
+
+                                _ ->
+                                    case materialName of
+                                        "Black" ->
+                                            Color.black
+
+                                        "Blue" ->
+                                            Color.blue
+
+                                        "Green" ->
+                                            Color.green
+
+                                        _ ->
+                                            Color.red
+                    in
+                    Scene3d.mesh (Scene3d.Material.nonmetal { baseColor = color, roughness = 0.2 }) uniformMesh
     in
     Scene3d.sunny
         { upDirection = Direction3d.z
@@ -283,7 +404,7 @@ meshView camera loadingTexture mesh =
         , dimensions = ( Pixels.int 640, Pixels.int 640 )
         , background = Scene3d.transparentBackground
         , clipDepth = Length.meters 0.1
-        , entities = [ entity ]
+        , entities = entities
         }
 
 
@@ -327,7 +448,7 @@ view model =
             (case model.meshWithBoundingBox of
                 Empty ->
                     [ Html.button [ Html.Events.onClick PickClicked ]
-                        [ Html.text "select an OBJ file and/or an image" ]
+                        [ Html.text "select an OBJ file, an MTL file and/or an image" ]
                     ]
 
                 Error err ->
@@ -337,7 +458,7 @@ view model =
                         [ Html.text "try a different OBJ file" ]
                     ]
 
-                Loaded ( mesh, boundingBox ) ->
+                Loaded ( meshes, boundingBox ) ->
                     let
                         { minX, maxX, minY, maxY, minZ, maxZ } =
                             BoundingBox3d.extrema boundingBox
@@ -360,7 +481,8 @@ view model =
                                 , verticalFieldOfView = Angle.degrees 30
                                 }
                     in
-                    [ meshView camera model.texture mesh
+                    [ Html.div []
+                        [ meshView camera model.materials model.texture meshes ]
                     , Html.button
                         [ Html.Attributes.style "position" "absolute"
                         , Html.Attributes.style "right" "10px"

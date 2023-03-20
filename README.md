@@ -49,3 +49,7 @@ If you want to use the shadow generation functionality from `elm-3d-scene`, your
 - [ ] smoothing groups `s`;
 - [ ] free-form curves and surfaces and related data;
 - [ ] miscellaneous display and rendering data attributes, e.g. `mtllib`.
+
+## MTL Format Support
+
+First draft of an MTL decoder is included; see the Viewer example for usage (load an obj model with corresponding mtl file).
