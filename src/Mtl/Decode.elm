@@ -45,8 +45,7 @@ decodeHelp lines lineno mode createMaterial materials =
             if startsWith == "newmtl" then
                 let
                     name =
-                        Debug.log "name" <|
-                            String.join " " remainingWords
+                        String.join " " remainingWords
                 in
                 if String.isEmpty name then
                     formatError lineno "Nameless material"
