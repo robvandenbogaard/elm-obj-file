@@ -1,14 +1,54 @@
-module Mtl.Decode exposing (decodeString)
+module Mtl.Decode exposing
+    ( decodeString
+    , MaterialCreator, MaterialLibrary
+    )
+
+{-|
+
+
+# Decoding
+
+@docs decodeString
+
+
+# Material
+
+@docs MaterialCreator, MaterialLibrary
+
+-}
 
 import Dict exposing (Dict)
 
 
-type DecodeMode a
+{-| A MaterialCreator is a function that takes a name, a list of words from the
+current Mtl line, and maybe the material that was already in the material
+library under the name. It outputs a material if successfully created from the
+given information, but it can also decide to not return a material even though
+it could, leaving the library unchanged.
+
+This is subject to change as the
+rationale for it is not entirely clear, suspecting the mechanism can be simpler.
+
+-}
+type alias MaterialCreator material =
+    String -> List String -> Maybe material -> Maybe material
+
+
+{-| A library of materials, a dictionary mapping names to materials.
+-}
+type alias MaterialLibrary material =
+    Dict String material
+
+
+type DecodeMode material
     = Initial
-    | NewMtl String (Maybe a)
+    | NewMtl String (Maybe material)
 
 
-decodeString : { createMaterial : String -> List String -> Maybe a -> Maybe a } -> String -> Result String (Dict String a)
+{-| Decode an mtl data string into a material library. This can fail so a
+Result is returned which can hold an error message if parsing fails.
+-}
+decodeString : { createMaterial : MaterialCreator material } -> String -> Result String (MaterialLibrary material)
 decodeString { createMaterial } content =
     decodeHelp (String.lines content) 1 Initial createMaterial Dict.empty
 
@@ -16,10 +56,10 @@ decodeString { createMaterial } content =
 decodeHelp :
     List String
     -> Int
-    -> DecodeMode a
-    -> (String -> List String -> Maybe a -> Maybe a)
-    -> Dict String a
-    -> Result String (Dict String a)
+    -> DecodeMode material
+    -> MaterialCreator material
+    -> MaterialLibrary material
+    -> Result String (MaterialLibrary material)
 decodeHelp lines lineno mode createMaterial materials =
     case lines of
         [] ->
@@ -102,7 +142,7 @@ decodeHelp lines lineno mode createMaterial materials =
                     )
 
 
-formatError : Int -> String -> Result String a
+formatError : Int -> String -> Result String material
 formatError lineno error =
     Err ("Line " ++ String.fromInt lineno ++ ": " ++ error)
 
